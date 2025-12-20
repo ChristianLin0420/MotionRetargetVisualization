@@ -4,17 +4,17 @@ SmoothMoCapRetarget converts human motion capture data into smooth, kinematicall
 ## Python Environment
 
 ```cmd
-conda create -n smooth-mocap-retarget python=3.8
-conda activate smooth-mocap-retarget
+conda create -n retarget python=3.8
+conda activate retarget
 pip install -r requirements.txt
 ```
 
 ## Recourse Preparation
 
 ### AMASS Dataset Preparation
-Download [AMASS Dataset](https://amass.is.tue.mpg.de/index.html) with `SMPL + H G` format and put it under `smooth-mocap-retarget/data/AMASS/AMASS_Complete/`:
+Download [AMASS Dataset](https://amass.is.tue.mpg.de/index.html) with `SMPL + H G` format and put it under `MotionRetargetVisualization/data/AMASS/AMASS_Complete/`:
 ```
-|-- smooth-mocap-retarget
+|-- MotionRetargetVisualization
    |-- data
       |-- AMASS
          |-- AMASS_Complete 
@@ -28,7 +28,7 @@ Download [AMASS Dataset](https://amass.is.tue.mpg.de/index.html) with `SMPL + H 
 
 ```
 
-And then `cd smooth-mocap-retarget/data/AMASS/AMASS_Complete` extract all the motion files by running:
+And then `cd MotionRetargetVisualization/data/AMASS/AMASS_Complete` extract all the motion files by running:
 ```
 for file in *.tar.bz2; do
     tar -xvjf "$file"
@@ -37,7 +37,7 @@ done
 
 Then you should have:
 ```
-|-- smooth-mocap-retarget
+|-- MotionRetargetVisualization
    |-- data
       |-- AMASS
          |-- AMASS_Complete 
@@ -53,9 +53,9 @@ Then you should have:
 
 ### Occlusion Label Preparation
 
-Download [Occlusion Labels](https://drive.google.com/uc?id=1uzFkT2s_zVdnAohPWHOLFcyRDq372Fmc) and put the `amass_copycat_occlusion_v3.pkl` file under `smooth-mocap-retarget/data/occlusion/`, then you should have:
+Download [Occlusion Labels](https://drive.google.com/uc?id=1uzFkT2s_zVdnAohPWHOLFcyRDq372Fmc) and put the `amass_copycat_occlusion_v3.pkl` file under `MotionRetargetVisualization/data/occlusion/`, then you should have:
 ```
-|-- smooth-mocap-retarget
+|-- MotionRetargetVisualization
    |-- data
       |-- occlusion
          |-- amass_copycat_occlusion_v3.pkl
@@ -63,9 +63,9 @@ Download [Occlusion Labels](https://drive.google.com/uc?id=1uzFkT2s_zVdnAohPWHOL
 
 ### Text Label Preparation
 
-Extract `texts.zip` into `smooth-mocap-retarget/data/` directory, and you should have:
+Extract `texts.zip` into `MotionRetargetVisualization/data/` directory, and you should have:
 ```
-|-- smooth-mocap-retarget
+|-- MotionRetargetVisualization
    |-- data
       |-- texts
          |-- 000000.txt
@@ -79,17 +79,17 @@ Extract `texts.zip` into `smooth-mocap-retarget/data/` directory, and you should
 
 ## SMPL Model Preparation
 
-Download [SMPL](https://smpl.is.tue.mpg.de/download.php) with `pkl` format and put it under `smooth-mocap-retarget/data/smpl/`, and you should have:
+Download [SMPL](https://smpl.is.tue.mpg.de/download.php) with `pkl` format and put it under `MotionRetargetVisualization/data/smpl/`, and you should have:
 ```
-|-- smooth-mocap-retarget
+|-- MotionRetargetVisualization
    |-- data
       |-- smpl
          |-- SMPL_python_v.1.1.0.zip
 ```
 
-Then `cd smooth-mocap-retarget/data/smpl` and  `unzip SMPL_python_v.1.1.0.zip`, you should have 
+Then `cd MotionRetargetVisualization/data/smpl` and  `unzip SMPL_python_v.1.1.0.zip`, you should have 
 ```
-|-- smooth-mocap-retarget
+|-- MotionRetargetVisualization
    |-- data
       |-- smpl
          |-- SMPL_python_v.1.1.0
@@ -102,7 +102,7 @@ Then `cd smooth-mocap-retarget/data/smpl` and  `unzip SMPL_python_v.1.1.0.zip`, 
 ```
 Rename these three pkl files and move it under smpl like this:
 ```
-|-- smooth-mocap-retarget
+|-- MotionRetargetVisualization
    |-- data
       |-- smpl
          |-- SMPL_FEMALE.pkl
@@ -112,8 +112,8 @@ Rename these three pkl files and move it under smpl like this:
 
 ### Robot Model Preparation
 
-Put the model description of your robot under `smooth-mocap-retarget/resources/robots`.
-Take `g1` robot for example, put `g1_29dof.xml` under `smooth-mocap-retarget/resources/robots/g1`
+Put the model description of your robot under `MotionRetargetVisualization/resources/robots`.
+Take `g1` robot for example, put `g1_29dof.xml` under `MotionRetargetVisualization/resources/robots/g1`
 
 ## Retargeting Procedure
 
@@ -121,15 +121,15 @@ Take `g1` robot for example, put `g1_29dof.xml` under `smooth-mocap-retarget/res
 
 Create the directory to store the fitted shape, and run the shape fitting script to align the standard smpl model with your own robot model.
 Take `g1` robot for example
-- Create the `smooth-mocap-retarget/data/g1` directory
-- Run `smooth-mocap-retarget/scripts/g1/fit_robot_shape.ipynb`, the fitted shape will be saved as `smooth-mocap-retarget/data/g1/fit_robot_shape_g1.pkl`
+- Create the `MotionRetargetVisualization/data/g1` directory
+- Run `MotionRetargetVisualization/scripts/g1/fit_robot_shape.ipynb`, the fitted shape will be saved as `MotionRetargetVisualization/data/g1/fit_robot_shape_g1.pkl`
 
 ### Retargeting based on Fitted Shape
 
 Run the motion retargeting script.
 Take `g1` robot for example
-- Run `smooth-mocap-retarget/scripts/g1/process_humanml3d_g1.ipynb`, the retargeted dataset will be saved under `smooth-mocap-retarget/data/g1/`
+- Run `MotionRetargetVisualization/scripts/g1/process_humanml3d_g1.ipynb`, the retargeted dataset will be saved under `MotionRetargetVisualization/data/g1/`
 
 ## Visualization
 
-Run `smooth-mocap-retarget/scripts/mujoco_visualization.py` to visualize the retargeted mocap dataset.
+Run `MotionRetargetVisualization/scripts/mujoco_visualization.py` to visualize the retargeted mocap dataset.
