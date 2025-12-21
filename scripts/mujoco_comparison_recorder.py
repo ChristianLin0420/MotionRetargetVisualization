@@ -22,6 +22,13 @@ import cv2
 from tqdm import tqdm
 from typing import List, Tuple, Optional
 
+# Import joint angle plotter for "angles" mode
+try:
+    from joint_angle_plotter import record_angle_comparison_video
+    ANGLES_AVAILABLE = True
+except ImportError:
+    ANGLES_AVAILABLE = False
+
 
 # =====================================================================
 # SMPL Skeleton Definition
@@ -100,6 +107,36 @@ ROBOT_LINK_PICK = [
 # =====================================================================
 # 3D to 2D Projection Utilities (MuJoCo-compatible)
 # =====================================================================
+
+def rotate_joints_around_z(joints: np.ndarray, angle_deg: float, center: np.ndarray = None) -> np.ndarray:
+    """
+    Rotate joints around the Z axis.
+    
+    Args:
+        joints: Joint positions, shape (N, 3)
+        angle_deg: Rotation angle in degrees
+        center: Center of rotation (default: origin)
+        
+    Returns:
+        Rotated joint positions
+    """
+    angle_rad = np.radians(angle_deg)
+    cos_a = np.cos(angle_rad)
+    sin_a = np.sin(angle_rad)
+    
+    rotation_matrix = np.array([
+        [cos_a, -sin_a, 0],
+        [sin_a, cos_a, 0],
+        [0, 0, 1]
+    ])
+    
+    if center is not None:
+        joints_centered = joints - center
+        rotated = joints_centered @ rotation_matrix.T
+        return rotated + center
+    else:
+        return joints @ rotation_matrix.T
+
 
 def create_mujoco_camera_params(distance: float, azimuth: float, elevation: float,
                                  lookat: np.ndarray, width: int, height: int,
@@ -475,23 +512,32 @@ def record_comparison_video_overlay(motion_data: dict, output_path: str,
             frame = renderer.render()
             frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
             
-            # Get SMPL data
+            # Get SMPL data - rotate to align with robot coordinate frame
             smpl_joints_t = smpl_joints[t]
+            smpl_pelvis = smpl_joints_t[0]
             
-            # Create projection for skeleton overlay (use robot_azimuth to match rendered robot)
+            # Rotate SMPL joints by -90 degrees around Z to align with robot's facing
+            # Then shift to robot's position for proper overlay
+            smpl_joints_rotated = rotate_joints_around_z(smpl_joints_t, -90, center=smpl_pelvis)
+            smpl_joints_aligned = smpl_joints_rotated - smpl_joints_rotated[0] + pos
+            
+            # Use same camera params as robot render for proper overlay
             cam_params = create_mujoco_camera_params(
                 cam_distance, robot_azimuth, cam_elevation, pos, width, height
             )
             
-            # Draw SMPL skeleton
-            smpl_2d = project_3d_to_2d(smpl_joints_t, cam_params)
+            # Draw SMPL skeleton (aligned with robot)
+            smpl_2d = project_3d_to_2d(smpl_joints_aligned, cam_params)
             frame_bgr = draw_skeleton(frame_bgr, smpl_2d, SMPL_PARENT_INDICES,
                                        color=(255, 150, 50), joint_radius=4, line_thickness=2)
             
             # Draw target keypoints with correspondence
             if target_keypoints is not None:
                 target_kp_t = target_keypoints[t]
-                target_kp_2d = project_3d_to_2d(target_kp_t, cam_params)
+                # Rotate and align target keypoints the same way
+                target_kp_rotated = rotate_joints_around_z(target_kp_t, -90, center=smpl_pelvis)
+                target_kp_aligned = target_kp_rotated - target_kp_rotated[0] + pos
+                target_kp_2d = project_3d_to_2d(target_kp_aligned, cam_params)
                 
                 # Get robot link positions for correspondence
                 robot_kp_3d = get_robot_link_positions(model, data, ROBOT_LINK_PICK)
@@ -697,6 +743,725 @@ def record_comparison_video_sidebyside(motion_data: dict, output_path: str,
 
 
 # =====================================================================
+# Joint Correspondence Visualization
+# =====================================================================
+
+# Color palette for joint correspondence (13 joints)
+CORRESPONDENCE_COLORS = [
+    (0, 0, 255),      # Pelvis - Red
+    (0, 128, 255),    # L_Hip - Orange
+    (0, 255, 0),      # L_Knee - Green
+    (255, 255, 0),    # L_Ankle - Cyan
+    (0, 255, 255),    # R_Hip - Yellow
+    (0, 255, 128),    # R_Knee - Light Green
+    (255, 200, 0),    # R_Ankle - Light Cyan
+    (255, 0, 0),      # L_Shoulder - Blue
+    (255, 0, 128),    # L_Elbow - Purple-blue
+    (255, 0, 255),    # L_Wrist - Magenta
+    (128, 0, 255),    # R_Shoulder - Purple
+    (200, 100, 255),  # R_Elbow - Light Purple
+    (180, 150, 255),  # R_Wrist - Pink
+]
+
+
+def draw_correspondence_legend(frame: np.ndarray, x_start: int = 10, y_start: int = 50) -> np.ndarray:
+    """Draw legend showing joint color mapping."""
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    font_scale = 0.5
+    thickness = 1
+    
+    for i, name in enumerate(TARGET_KEYPOINT_NAMES):
+        color = CORRESPONDENCE_COLORS[i]
+        y = y_start + i * 20
+        cv2.circle(frame, (x_start + 10, y), 6, color, -1)
+        cv2.putText(frame, name, (x_start + 25, y + 5), font, font_scale, (255, 255, 255), thickness)
+    
+    return frame
+
+
+def record_correspondence_video(motion_data: dict, output_path: str,
+                                 model_path: str, caption: str = "",
+                                 fps: int = 30, width: int = 1280, height: int = 720) -> bool:
+    """
+    Record video showing color-coded joint correspondence mapping.
+    Shows SMPL skeleton and robot with colored lines connecting corresponding joints.
+    """
+    # Extract data
+    root_position = motion_data.get("root_trans_offset")
+    root_orientation = motion_data.get("root_rot")
+    joint_positions_all = motion_data.get("dof")
+    smpl_joints = motion_data.get("mocap_global_translation")
+    target_keypoints = motion_data.get("target_keypoints")
+    
+    if any(x is None for x in [root_position, root_orientation, joint_positions_all, smpl_joints]):
+        print("Missing required data")
+        return False
+    
+    if root_orientation.shape[1] == 4:
+        root_orientation = root_orientation[:, [3, 0, 1, 2]]
+    
+    if hasattr(smpl_joints, 'numpy'):
+        smpl_joints = smpl_joints.numpy()
+    if target_keypoints is not None and hasattr(target_keypoints, 'numpy'):
+        target_keypoints = target_keypoints.numpy()
+    
+    # Robot joint configuration
+    robot_joint_names = [
+        "left_hip_pitch_joint", "left_hip_roll_joint", "left_hip_yaw_joint",
+        "left_knee_joint", "left_ankle_pitch_joint", "left_ankle_roll_joint",
+        "right_hip_pitch_joint", "right_hip_roll_joint", "right_hip_yaw_joint",
+        "right_knee_joint", "right_ankle_pitch_joint", "right_ankle_roll_joint",
+        "waist_yaw_joint", "waist_roll_joint", "waist_pitch_joint",
+        "left_shoulder_pitch_joint", "left_shoulder_roll_joint", "left_shoulder_yaw_joint",
+        "left_elbow_joint", "left_wrist_roll_joint", "left_wrist_pitch_joint", "left_wrist_yaw_joint",
+        "right_shoulder_pitch_joint", "right_shoulder_roll_joint", "right_shoulder_yaw_joint",
+        "right_elbow_joint", "right_wrist_roll_joint", "right_wrist_pitch_joint", "right_wrist_yaw_joint",
+    ]
+    
+    active_robot_joint_names = [
+        "left_hip_pitch_joint", "left_hip_roll_joint", "left_hip_yaw_joint",
+        "left_knee_joint", "left_ankle_pitch_joint", "left_ankle_roll_joint",
+        "right_hip_pitch_joint", "right_hip_roll_joint", "right_hip_yaw_joint",
+        "right_knee_joint", "right_ankle_pitch_joint", "right_ankle_roll_joint",
+        "waist_yaw_joint",
+        "left_shoulder_pitch_joint", "left_shoulder_roll_joint", "left_shoulder_yaw_joint",
+        "left_elbow_joint", "left_wrist_roll_joint", "left_wrist_pitch_joint", "left_wrist_yaw_joint",
+        "right_shoulder_pitch_joint", "right_shoulder_roll_joint", "right_shoulder_yaw_joint",
+        "right_elbow_joint", "right_wrist_roll_joint", "right_wrist_pitch_joint", "right_wrist_yaw_joint",
+    ]
+    
+    active_robot_joint_indices = [robot_joint_names.index(j) for j in active_robot_joint_names]
+    joint_positions = joint_positions_all[:, active_robot_joint_indices]
+    
+    try:
+        model = mujoco.MjModel.from_xml_path(model_path)
+        model.vis.global_.offwidth = width
+        model.vis.global_.offheight = height
+        data = mujoco.MjData(model)
+        renderer = mujoco.Renderer(model, height=height, width=width)
+    except Exception as e:
+        print(f"Error loading MuJoCo model: {e}")
+        return False
+    
+    T = root_position.shape[0]
+    floating_base_dof = 7
+    n_joints = model.nq - floating_base_dof
+    
+    if joint_positions.shape[1] != n_joints:
+        return False
+    
+    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+    video_writer = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
+    
+    if not video_writer.isOpened():
+        return False
+    
+    cam_distance = 3.5
+    cam_elevation = -15
+    robot_azimuth = 0      # Robot render azimuth (keep unchanged)
+    skeleton_azimuth = 90  # Skeleton projection azimuth
+    
+    try:
+        for t in tqdm(range(T), desc="Rendering frames", leave=False):
+            pos = root_position[t]
+            quat = root_orientation[t]
+            
+            data.qpos[0:3] = pos
+            data.qpos[3:7] = quat
+            data.qpos[7:] = joint_positions[t]
+            data.qvel[:] = 0
+            mujoco.mj_forward(model, data)
+            
+            # Render robot with robot_azimuth
+            camera = mujoco.MjvCamera()
+            camera.type = mujoco.mjtCamera.mjCAMERA_FREE
+            camera.distance = cam_distance
+            camera.azimuth = robot_azimuth
+            camera.elevation = cam_elevation
+            camera.lookat[:] = pos
+            
+            renderer.update_scene(data, camera=camera)
+            frame = renderer.render()
+            frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+            
+            # Skeleton projection uses skeleton_azimuth with flip_x
+            smpl_joints_t = smpl_joints[t]
+            smpl_pelvis = smpl_joints_t[0]
+            skeleton_cam_params = create_mujoco_camera_params(
+                cam_distance, skeleton_azimuth, cam_elevation, smpl_pelvis, width, height
+            )
+            
+            # Robot link projection uses robot_azimuth (no flip_x)
+            robot_cam_params = create_mujoco_camera_params(
+                cam_distance, robot_azimuth, cam_elevation, pos, width, height
+            )
+            
+            # Draw SMPL skeleton in gray
+            smpl_2d = project_3d_to_2d(smpl_joints_t, skeleton_cam_params, flip_x=True)
+            frame_bgr = draw_skeleton(frame_bgr, smpl_2d, SMPL_PARENT_INDICES,
+                                      color=(100, 100, 100), joint_radius=3, line_thickness=1)
+            
+            # Draw color-coded correspondence
+            if target_keypoints is not None:
+                target_kp_t = target_keypoints[t]
+                target_kp_2d = project_3d_to_2d(target_kp_t, skeleton_cam_params, flip_x=True)
+                robot_kp_3d = get_robot_link_positions(model, data, ROBOT_LINK_PICK)
+                robot_kp_2d = project_3d_to_2d(robot_kp_3d, robot_cam_params)
+                
+                # Draw correspondence lines with unique colors
+                for i in range(len(target_kp_2d)):
+                    color = CORRESPONDENCE_COLORS[i]
+                    pt1 = tuple(target_kp_2d[i])
+                    pt2 = tuple(robot_kp_2d[i])
+                    cv2.line(frame_bgr, pt1, pt2, color, 2, cv2.LINE_AA)
+                    cv2.circle(frame_bgr, pt1, 8, color, -1)
+                    cv2.circle(frame_bgr, pt2, 6, color, 2)
+            
+            # Add legend
+            frame_bgr = draw_correspondence_legend(frame_bgr, width - 150, 50)
+            frame_bgr = add_stage_label(frame_bgr, "Joint Correspondence", (10, 30), (255, 255, 255))
+            frame_bgr = add_caption(frame_bgr, caption)
+            
+            video_writer.write(frame_bgr)
+    
+    except Exception as e:
+        print(f"Error during rendering: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
+    finally:
+        video_writer.release()
+        renderer.close()
+    
+    return True
+
+
+# =====================================================================
+# IK Error Visualization
+# =====================================================================
+
+def get_error_color(error: float, max_error: float = 0.1) -> Tuple[int, int, int]:
+    """Get color based on error magnitude (green -> yellow -> red)."""
+    ratio = min(error / max_error, 1.0)
+    
+    if ratio < 0.5:
+        t = ratio * 2
+        return (0, 255, int(255 * t))  # Green to Yellow
+    else:
+        t = (ratio - 0.5) * 2
+        return (0, int(255 * (1 - t)), 255)  # Yellow to Red
+
+
+def record_error_video(motion_data: dict, output_path: str,
+                        model_path: str, caption: str = "",
+                        fps: int = 30, width: int = 1280, height: int = 720) -> bool:
+    """
+    Record video showing IK error with color gradient and statistics.
+    """
+    root_position = motion_data.get("root_trans_offset")
+    root_orientation = motion_data.get("root_rot")
+    joint_positions_all = motion_data.get("dof")
+    target_keypoints = motion_data.get("target_keypoints")
+    
+    if any(x is None for x in [root_position, root_orientation, joint_positions_all, target_keypoints]):
+        print("Missing required data")
+        return False
+    
+    if root_orientation.shape[1] == 4:
+        root_orientation = root_orientation[:, [3, 0, 1, 2]]
+    
+    if hasattr(target_keypoints, 'numpy'):
+        target_keypoints = target_keypoints.numpy()
+    
+    robot_joint_names = [
+        "left_hip_pitch_joint", "left_hip_roll_joint", "left_hip_yaw_joint",
+        "left_knee_joint", "left_ankle_pitch_joint", "left_ankle_roll_joint",
+        "right_hip_pitch_joint", "right_hip_roll_joint", "right_hip_yaw_joint",
+        "right_knee_joint", "right_ankle_pitch_joint", "right_ankle_roll_joint",
+        "waist_yaw_joint", "waist_roll_joint", "waist_pitch_joint",
+        "left_shoulder_pitch_joint", "left_shoulder_roll_joint", "left_shoulder_yaw_joint",
+        "left_elbow_joint", "left_wrist_roll_joint", "left_wrist_pitch_joint", "left_wrist_yaw_joint",
+        "right_shoulder_pitch_joint", "right_shoulder_roll_joint", "right_shoulder_yaw_joint",
+        "right_elbow_joint", "right_wrist_roll_joint", "right_wrist_pitch_joint", "right_wrist_yaw_joint",
+    ]
+    
+    active_robot_joint_names = [
+        "left_hip_pitch_joint", "left_hip_roll_joint", "left_hip_yaw_joint",
+        "left_knee_joint", "left_ankle_pitch_joint", "left_ankle_roll_joint",
+        "right_hip_pitch_joint", "right_hip_roll_joint", "right_hip_yaw_joint",
+        "right_knee_joint", "right_ankle_pitch_joint", "right_ankle_roll_joint",
+        "waist_yaw_joint",
+        "left_shoulder_pitch_joint", "left_shoulder_roll_joint", "left_shoulder_yaw_joint",
+        "left_elbow_joint", "left_wrist_roll_joint", "left_wrist_pitch_joint", "left_wrist_yaw_joint",
+        "right_shoulder_pitch_joint", "right_shoulder_roll_joint", "right_shoulder_yaw_joint",
+        "right_elbow_joint", "right_wrist_roll_joint", "right_wrist_pitch_joint", "right_wrist_yaw_joint",
+    ]
+    
+    active_robot_joint_indices = [robot_joint_names.index(j) for j in active_robot_joint_names]
+    joint_positions = joint_positions_all[:, active_robot_joint_indices]
+    
+    try:
+        model = mujoco.MjModel.from_xml_path(model_path)
+        model.vis.global_.offwidth = width
+        model.vis.global_.offheight = height
+        data = mujoco.MjData(model)
+        renderer = mujoco.Renderer(model, height=height, width=width)
+    except Exception as e:
+        print(f"Error loading MuJoCo model: {e}")
+        return False
+    
+    T = root_position.shape[0]
+    floating_base_dof = 7
+    n_joints = model.nq - floating_base_dof
+    
+    if joint_positions.shape[1] != n_joints:
+        return False
+    
+    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+    video_writer = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
+    
+    if not video_writer.isOpened():
+        return False
+    
+    cam_distance = 3.5
+    cam_elevation = -15
+    robot_azimuth = 0      # Robot render azimuth (keep unchanged)
+    skeleton_azimuth = 90  # Skeleton projection azimuth
+    
+    # Collect all errors for statistics
+    all_errors = []
+    
+    try:
+        for t in tqdm(range(T), desc="Rendering frames", leave=False):
+            pos = root_position[t]
+            quat = root_orientation[t]
+            
+            data.qpos[0:3] = pos
+            data.qpos[3:7] = quat
+            data.qpos[7:] = joint_positions[t]
+            data.qvel[:] = 0
+            mujoco.mj_forward(model, data)
+            
+            camera = mujoco.MjvCamera()
+            camera.type = mujoco.mjtCamera.mjCAMERA_FREE
+            camera.distance = cam_distance
+            camera.azimuth = robot_azimuth
+            camera.elevation = cam_elevation
+            camera.lookat[:] = pos
+            
+            renderer.update_scene(data, camera=camera)
+            frame = renderer.render()
+            frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+            
+            # Calculate errors
+            target_kp_t = target_keypoints[t]
+            target_pelvis = target_kp_t[0]
+            robot_kp_3d = get_robot_link_positions(model, data, ROBOT_LINK_PICK)
+            errors = np.linalg.norm(target_kp_t - robot_kp_3d, axis=1)
+            all_errors.append(errors)
+            
+            # Rotate and align target keypoints to match robot coordinate frame
+            target_kp_rotated = rotate_joints_around_z(target_kp_t, -90, center=target_pelvis)
+            target_kp_aligned = target_kp_rotated - target_kp_rotated[0] + pos
+            
+            # Use same camera params as robot render for proper overlay
+            cam_params = create_mujoco_camera_params(
+                cam_distance, robot_azimuth, cam_elevation, pos, width, height
+            )
+            
+            target_kp_2d = project_3d_to_2d(target_kp_aligned, cam_params)
+            robot_kp_2d = project_3d_to_2d(robot_kp_3d, cam_params)
+            
+            # Draw error visualization
+            for i in range(len(target_kp_2d)):
+                error = errors[i]
+                color = get_error_color(error, max_error=0.1)
+                pt_target = tuple(target_kp_2d[i])
+                pt_robot = tuple(robot_kp_2d[i])
+                
+                # Draw error line
+                cv2.line(frame_bgr, pt_target, pt_robot, color, 2, cv2.LINE_AA)
+                
+                # Draw target keypoint with error-colored circle
+                radius = int(10 + error * 100)  # Larger radius for larger error
+                cv2.circle(frame_bgr, pt_target, radius, color, 2)
+                cv2.circle(frame_bgr, pt_target, 4, color, -1)
+            
+            # Draw error statistics
+            mean_error = np.mean(errors) * 100  # cm
+            max_error = np.max(errors) * 100
+            stats_text = f"Mean: {mean_error:.1f}cm  Max: {max_error:.1f}cm"
+            cv2.rectangle(frame_bgr, (10, height - 60), (300, height - 30), (0, 0, 0), -1)
+            cv2.putText(frame_bgr, stats_text, (15, height - 40),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+            
+            # Draw error color bar
+            bar_x, bar_y = width - 60, 50
+            bar_height = 200
+            for i in range(bar_height):
+                ratio = i / bar_height
+                color = get_error_color(ratio * 0.1, 0.1)
+                cv2.line(frame_bgr, (bar_x, bar_y + bar_height - i),
+                         (bar_x + 30, bar_y + bar_height - i), color, 1)
+            cv2.putText(frame_bgr, "0cm", (bar_x - 5, bar_y + bar_height + 15),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
+            cv2.putText(frame_bgr, "10cm", (bar_x - 10, bar_y - 5),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
+            
+            frame_bgr = add_stage_label(frame_bgr, "IK Error Visualization", (10, 30), (255, 255, 255))
+            frame_bgr = add_caption(frame_bgr, caption)
+            
+            video_writer.write(frame_bgr)
+    
+    except Exception as e:
+        print(f"Error during rendering: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
+    finally:
+        video_writer.release()
+        renderer.close()
+    
+    return True
+
+
+# =====================================================================
+# Multi-View Visualization
+# =====================================================================
+
+def record_multiview_video(motion_data: dict, output_path: str,
+                            model_path: str, caption: str = "",
+                            fps: int = 30, panel_size: int = 480) -> bool:
+    """
+    Record video with 2x2 grid showing front, side, top, and 3/4 views.
+    """
+    root_position = motion_data.get("root_trans_offset")
+    root_orientation = motion_data.get("root_rot")
+    joint_positions_all = motion_data.get("dof")
+    smpl_joints = motion_data.get("mocap_global_translation")
+    
+    if any(x is None for x in [root_position, root_orientation, joint_positions_all, smpl_joints]):
+        print("Missing required data")
+        return False
+    
+    if root_orientation.shape[1] == 4:
+        root_orientation = root_orientation[:, [3, 0, 1, 2]]
+    
+    if hasattr(smpl_joints, 'numpy'):
+        smpl_joints = smpl_joints.numpy()
+    
+    robot_joint_names = [
+        "left_hip_pitch_joint", "left_hip_roll_joint", "left_hip_yaw_joint",
+        "left_knee_joint", "left_ankle_pitch_joint", "left_ankle_roll_joint",
+        "right_hip_pitch_joint", "right_hip_roll_joint", "right_hip_yaw_joint",
+        "right_knee_joint", "right_ankle_pitch_joint", "right_ankle_roll_joint",
+        "waist_yaw_joint", "waist_roll_joint", "waist_pitch_joint",
+        "left_shoulder_pitch_joint", "left_shoulder_roll_joint", "left_shoulder_yaw_joint",
+        "left_elbow_joint", "left_wrist_roll_joint", "left_wrist_pitch_joint", "left_wrist_yaw_joint",
+        "right_shoulder_pitch_joint", "right_shoulder_roll_joint", "right_shoulder_yaw_joint",
+        "right_elbow_joint", "right_wrist_roll_joint", "right_wrist_pitch_joint", "right_wrist_yaw_joint",
+    ]
+    
+    active_robot_joint_names = [
+        "left_hip_pitch_joint", "left_hip_roll_joint", "left_hip_yaw_joint",
+        "left_knee_joint", "left_ankle_pitch_joint", "left_ankle_roll_joint",
+        "right_hip_pitch_joint", "right_hip_roll_joint", "right_hip_yaw_joint",
+        "right_knee_joint", "right_ankle_pitch_joint", "right_ankle_roll_joint",
+        "waist_yaw_joint",
+        "left_shoulder_pitch_joint", "left_shoulder_roll_joint", "left_shoulder_yaw_joint",
+        "left_elbow_joint", "left_wrist_roll_joint", "left_wrist_pitch_joint", "left_wrist_yaw_joint",
+        "right_shoulder_pitch_joint", "right_shoulder_roll_joint", "right_shoulder_yaw_joint",
+        "right_elbow_joint", "right_wrist_roll_joint", "right_wrist_pitch_joint", "right_wrist_yaw_joint",
+    ]
+    
+    active_robot_joint_indices = [robot_joint_names.index(j) for j in active_robot_joint_names]
+    joint_positions = joint_positions_all[:, active_robot_joint_indices]
+    
+    try:
+        model = mujoco.MjModel.from_xml_path(model_path)
+        model.vis.global_.offwidth = panel_size
+        model.vis.global_.offheight = panel_size
+        data = mujoco.MjData(model)
+        renderer = mujoco.Renderer(model, height=panel_size, width=panel_size)
+    except Exception as e:
+        print(f"Error loading MuJoCo model: {e}")
+        return False
+    
+    T = root_position.shape[0]
+    floating_base_dof = 7
+    n_joints = model.nq - floating_base_dof
+    
+    if joint_positions.shape[1] != n_joints:
+        return False
+    
+    total_width = panel_size * 2
+    total_height = panel_size * 2
+    
+    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+    video_writer = cv2.VideoWriter(output_path, fourcc, fps, (total_width, total_height))
+    
+    if not video_writer.isOpened():
+        return False
+    
+    cam_distance = 3.5
+    
+    # Camera configurations: (azimuth, elevation, label)
+    cameras = [
+        (0, -15, "Front View"),
+        (90, -15, "Side View"),
+        (0, 89, "Top View"),
+        (45, -15, "3/4 View"),
+    ]
+    
+    try:
+        for t in tqdm(range(T), desc="Rendering frames", leave=False):
+            pos = root_position[t]
+            quat = root_orientation[t]
+            
+            data.qpos[0:3] = pos
+            data.qpos[3:7] = quat
+            data.qpos[7:] = joint_positions[t]
+            data.qvel[:] = 0
+            mujoco.mj_forward(model, data)
+            
+            panels = []
+            for azimuth, elevation, label in cameras:
+                camera = mujoco.MjvCamera()
+                camera.type = mujoco.mjtCamera.mjCAMERA_FREE
+                camera.distance = cam_distance
+                camera.azimuth = azimuth
+                camera.elevation = elevation
+                camera.lookat[:] = pos
+                
+                renderer.update_scene(data, camera=camera)
+                panel = renderer.render()
+                panel = cv2.cvtColor(panel, cv2.COLOR_RGB2BGR)
+                
+                # Add skeleton overlay
+                # For skeleton to align with robot: skeleton_azimuth = robot_azimuth + 90
+                smpl_joints_t = smpl_joints[t]
+                smpl_pelvis = smpl_joints_t[0]
+                skeleton_azimuth = azimuth + 90  # Offset by 90 to match robot facing
+                cam_params = create_mujoco_camera_params(
+                    cam_distance, skeleton_azimuth, elevation, smpl_pelvis, panel_size, panel_size
+                )
+                smpl_2d = project_3d_to_2d(smpl_joints_t, cam_params, flip_x=True)
+                panel = draw_skeleton(panel, smpl_2d, SMPL_PARENT_INDICES,
+                                      color=(255, 150, 50), joint_radius=3, line_thickness=2, alpha=0.7)
+                
+                panel = add_stage_label(panel, label, (10, 25), (255, 255, 255))
+                panels.append(panel)
+            
+            # Arrange in 2x2 grid
+            top_row = np.hstack([panels[0], panels[1]])
+            bottom_row = np.hstack([panels[2], panels[3]])
+            combined = np.vstack([top_row, bottom_row])
+            
+            combined = add_caption(combined, caption, position="bottom")
+            video_writer.write(combined)
+    
+    except Exception as e:
+        print(f"Error during rendering: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
+    finally:
+        video_writer.release()
+        renderer.close()
+    
+    return True
+
+
+# =====================================================================
+# Trajectory Trails Visualization
+# =====================================================================
+
+# Trajectory colors for different joints
+TRAJECTORY_COLORS_MAP = {
+    0: (255, 255, 255),    # Pelvis - White
+    22: (255, 100, 100),   # L_Hand - Light Blue
+    23: (100, 100, 255),   # R_Hand - Light Red
+    10: (255, 255, 100),   # L_Toe - Cyan
+    11: (100, 255, 255),   # R_Toe - Yellow
+}
+
+TRAJECTORY_JOINTS = [0, 22, 23, 10, 11]  # Pelvis, L_Hand, R_Hand, L_Toe, R_Toe
+TRAJECTORY_NAMES = ["Pelvis", "L_Hand", "R_Hand", "L_Foot", "R_Foot"]
+TRAIL_LENGTH = 30
+
+
+def record_trajectory_video(motion_data: dict, output_path: str,
+                             model_path: str, caption: str = "",
+                             fps: int = 30, width: int = 1280, height: int = 720) -> bool:
+    """
+    Record video showing motion trajectory trails for key joints.
+    """
+    root_position = motion_data.get("root_trans_offset")
+    root_orientation = motion_data.get("root_rot")
+    joint_positions_all = motion_data.get("dof")
+    smpl_joints = motion_data.get("mocap_global_translation")
+    
+    if any(x is None for x in [root_position, root_orientation, joint_positions_all, smpl_joints]):
+        print("Missing required data")
+        return False
+    
+    if root_orientation.shape[1] == 4:
+        root_orientation = root_orientation[:, [3, 0, 1, 2]]
+    
+    if hasattr(smpl_joints, 'numpy'):
+        smpl_joints = smpl_joints.numpy()
+    
+    robot_joint_names = [
+        "left_hip_pitch_joint", "left_hip_roll_joint", "left_hip_yaw_joint",
+        "left_knee_joint", "left_ankle_pitch_joint", "left_ankle_roll_joint",
+        "right_hip_pitch_joint", "right_hip_roll_joint", "right_hip_yaw_joint",
+        "right_knee_joint", "right_ankle_pitch_joint", "right_ankle_roll_joint",
+        "waist_yaw_joint", "waist_roll_joint", "waist_pitch_joint",
+        "left_shoulder_pitch_joint", "left_shoulder_roll_joint", "left_shoulder_yaw_joint",
+        "left_elbow_joint", "left_wrist_roll_joint", "left_wrist_pitch_joint", "left_wrist_yaw_joint",
+        "right_shoulder_pitch_joint", "right_shoulder_roll_joint", "right_shoulder_yaw_joint",
+        "right_elbow_joint", "right_wrist_roll_joint", "right_wrist_pitch_joint", "right_wrist_yaw_joint",
+    ]
+    
+    active_robot_joint_names = [
+        "left_hip_pitch_joint", "left_hip_roll_joint", "left_hip_yaw_joint",
+        "left_knee_joint", "left_ankle_pitch_joint", "left_ankle_roll_joint",
+        "right_hip_pitch_joint", "right_hip_roll_joint", "right_hip_yaw_joint",
+        "right_knee_joint", "right_ankle_pitch_joint", "right_ankle_roll_joint",
+        "waist_yaw_joint",
+        "left_shoulder_pitch_joint", "left_shoulder_roll_joint", "left_shoulder_yaw_joint",
+        "left_elbow_joint", "left_wrist_roll_joint", "left_wrist_pitch_joint", "left_wrist_yaw_joint",
+        "right_shoulder_pitch_joint", "right_shoulder_roll_joint", "right_shoulder_yaw_joint",
+        "right_elbow_joint", "right_wrist_roll_joint", "right_wrist_pitch_joint", "right_wrist_yaw_joint",
+    ]
+    
+    active_robot_joint_indices = [robot_joint_names.index(j) for j in active_robot_joint_names]
+    joint_positions = joint_positions_all[:, active_robot_joint_indices]
+    
+    try:
+        model = mujoco.MjModel.from_xml_path(model_path)
+        model.vis.global_.offwidth = width
+        model.vis.global_.offheight = height
+        data = mujoco.MjData(model)
+        renderer = mujoco.Renderer(model, height=height, width=width)
+    except Exception as e:
+        print(f"Error loading MuJoCo model: {e}")
+        return False
+    
+    T = root_position.shape[0]
+    floating_base_dof = 7
+    n_joints = model.nq - floating_base_dof
+    
+    if joint_positions.shape[1] != n_joints:
+        return False
+    
+    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+    video_writer = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
+    
+    if not video_writer.isOpened():
+        return False
+    
+    cam_distance = 4.0  # Slightly further for trajectory view
+    cam_elevation = -20
+    robot_azimuth = 0      # Robot render azimuth (keep unchanged)
+    skeleton_azimuth = 90  # Skeleton projection azimuth
+    
+    # Store trajectory history
+    trajectory_history = {joint_idx: [] for joint_idx in TRAJECTORY_JOINTS}
+    
+    try:
+        for t in tqdm(range(T), desc="Rendering frames", leave=False):
+            pos = root_position[t]
+            quat = root_orientation[t]
+            
+            data.qpos[0:3] = pos
+            data.qpos[3:7] = quat
+            data.qpos[7:] = joint_positions[t]
+            data.qvel[:] = 0
+            mujoco.mj_forward(model, data)
+            
+            camera = mujoco.MjvCamera()
+            camera.type = mujoco.mjtCamera.mjCAMERA_FREE
+            camera.distance = cam_distance
+            camera.azimuth = robot_azimuth
+            camera.elevation = cam_elevation
+            camera.lookat[:] = pos
+            
+            renderer.update_scene(data, camera=camera)
+            frame = renderer.render()
+            frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+            
+            # Get SMPL data and rotate to align with robot coordinate frame
+            smpl_joints_t = smpl_joints[t]
+            smpl_pelvis = smpl_joints_t[0]
+            
+            # Rotate and align SMPL joints to match robot's coordinate frame
+            smpl_joints_rotated = rotate_joints_around_z(smpl_joints_t, -90, center=smpl_pelvis)
+            smpl_joints_aligned = smpl_joints_rotated - smpl_joints_rotated[0] + pos
+            
+            # Update trajectory history with aligned positions
+            for joint_idx in TRAJECTORY_JOINTS:
+                trajectory_history[joint_idx].append(smpl_joints_aligned[joint_idx].copy())
+                if len(trajectory_history[joint_idx]) > TRAIL_LENGTH:
+                    trajectory_history[joint_idx].pop(0)
+            
+            # Use same camera params as robot render for proper overlay
+            cam_params = create_mujoco_camera_params(
+                cam_distance, robot_azimuth, cam_elevation, pos, width, height
+            )
+            
+            # Draw trajectory trails
+            for joint_idx in TRAJECTORY_JOINTS:
+                color = TRAJECTORY_COLORS_MAP[joint_idx]
+                history = trajectory_history[joint_idx]
+                
+                if len(history) > 1:
+                    # Project all points
+                    points_3d = np.array(history)
+                    points_2d = project_3d_to_2d(points_3d, cam_params)
+                    
+                    # Draw trail with fading alpha
+                    for i in range(len(points_2d) - 1):
+                        alpha = (i + 1) / len(points_2d)
+                        faded_color = tuple(int(c * alpha) for c in color)
+                        pt1 = tuple(points_2d[i])
+                        pt2 = tuple(points_2d[i + 1])
+                        cv2.line(frame_bgr, pt1, pt2, faded_color, 2, cv2.LINE_AA)
+                    
+                    # Draw current position
+                    cv2.circle(frame_bgr, tuple(points_2d[-1]), 6, color, -1)
+            
+            # Draw skeleton
+            smpl_2d = project_3d_to_2d(smpl_joints_aligned, cam_params)
+            frame_bgr = draw_skeleton(frame_bgr, smpl_2d, SMPL_PARENT_INDICES,
+                                      color=(255, 150, 50), joint_radius=3, line_thickness=1, alpha=0.5)
+            
+            # Add legend
+            legend_y = 50
+            for i, (joint_idx, name) in enumerate(zip(TRAJECTORY_JOINTS, TRAJECTORY_NAMES)):
+                color = TRAJECTORY_COLORS_MAP[joint_idx]
+                cv2.circle(frame_bgr, (width - 100, legend_y + i * 25), 6, color, -1)
+                cv2.putText(frame_bgr, name, (width - 85, legend_y + i * 25 + 5),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+            
+            frame_bgr = add_stage_label(frame_bgr, "Trajectory Trails", (10, 30), (255, 255, 255))
+            frame_bgr = add_caption(frame_bgr, caption)
+            
+            video_writer.write(frame_bgr)
+    
+    except Exception as e:
+        print(f"Error during rendering: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
+    finally:
+        video_writer.release()
+        renderer.close()
+    
+    return True
+
+
+# =====================================================================
 # Main Entry Point
 # =====================================================================
 
@@ -704,10 +1469,11 @@ if __name__ == "__main__":
     import argparse
     
     parser = argparse.ArgumentParser(description="Multi-stage motion retargeting visualization")
-    parser.add_argument("--mode", type=str, default="overlay", choices=["overlay", "sidebyside"],
-                        help="Visualization mode: overlay or sidebyside")
+    parser.add_argument("--mode", type=str, default="sidebyside",
+                        choices=["overlay", "sidebyside", "correspondence", "error", "multiview", "trajectory", "angles", "all"],
+                        help="Visualization mode (use 'all' to generate all modes)")
     parser.add_argument("--max_motions", type=int, default=5,
-                        help="Maximum number of motions to record (None for all)")
+                        help="Maximum number of motions to record")
     parser.add_argument("--output_dir", type=str, default=None,
                         help="Output directory for videos")
     args = parser.parse_args()
@@ -717,12 +1483,20 @@ if __name__ == "__main__":
     motion_data_path = os.path.join(current_dir, "../data/g1/humanml3d_train_retargeted_wholebody_82.pkl")
     model_path = os.path.join(current_dir, '../resources/robots/g1/g1_27dof.xml')
     
-    if args.output_dir:
-        output_dir = args.output_dir
-    else:
-        output_dir = os.path.join(current_dir, f"../output/videos_comparison_{args.mode}")
+    # Define all available modes (excluding "all")
+    ALL_MODES = ["overlay", "sidebyside", "correspondence", "error", "multiview", "trajectory"]
+    if ANGLES_AVAILABLE:
+        ALL_MODES.append("angles")
     
-    os.makedirs(output_dir, exist_ok=True)
+    # Determine which modes to run
+    if args.mode == "all":
+        modes_to_run = ALL_MODES
+        base_output_dir = args.output_dir if args.output_dir else os.path.join(current_dir, "../output/videos_all")
+    else:
+        modes_to_run = [args.mode]
+        base_output_dir = args.output_dir if args.output_dir else os.path.join(current_dir, f"../output/videos_{args.mode}")
+    
+    os.makedirs(base_output_dir, exist_ok=True)
     
     # Load motion dataset
     print("Loading motion dataset...")
@@ -735,30 +1509,77 @@ if __name__ == "__main__":
     if args.max_motions:
         motion_names = motion_names[:args.max_motions]
     
-    print(f"Recording {len(motion_names)} motions in {args.mode} mode...")
+    print(f"Recording {len(motion_names)} motions in {', '.join(modes_to_run)} mode(s)...")
     
-    for motion_name in tqdm(motion_names, desc="Recording videos"):
-        motion_data = motion_dataset[motion_name]
-        captions = motion_data.get("captions", [])
-        caption = captions[0] if captions else ""
-        
-        output_path = os.path.join(output_dir, f"{motion_name.replace('.npz', '')}_{args.mode}.mp4")
-        
-        if args.mode == "overlay":
-            success = record_comparison_video_overlay(
+    def record_single_mode(motion_data, output_path, mode, caption):
+        """Record a single visualization mode."""
+        if mode == "overlay":
+            return record_comparison_video_overlay(
                 motion_data, output_path, model_path, caption=caption,
                 fps=30, width=1280, height=720
             )
-        else:
-            success = record_comparison_video_sidebyside(
+        elif mode == "sidebyside":
+            return record_comparison_video_sidebyside(
                 motion_data, output_path, model_path, caption=caption,
                 fps=30, panel_width=640, panel_height=720
             )
-        
-        if success:
-            print(f"  Saved: {output_path}")
-        else:
-            print(f"  Failed: {motion_name}")
+        elif mode == "correspondence":
+            return record_correspondence_video(
+                motion_data, output_path, model_path, caption=caption,
+                fps=30, width=1280, height=720
+            )
+        elif mode == "error":
+            return record_error_video(
+                motion_data, output_path, model_path, caption=caption,
+                fps=30, width=1280, height=720
+            )
+        elif mode == "multiview":
+            return record_multiview_video(
+                motion_data, output_path, model_path, caption=caption,
+                fps=30, panel_size=480
+            )
+        elif mode == "trajectory":
+            return record_trajectory_video(
+                motion_data, output_path, model_path, caption=caption,
+                fps=30, width=1280, height=720
+            )
+        elif mode == "angles":
+            if ANGLES_AVAILABLE:
+                return record_angle_comparison_video(
+                    motion_data, output_path, model_path, caption=caption,
+                    fps=30, width=1280
+                )
+            else:
+                print("  Warning: angles mode not available (joint_angle_plotter.py not found)")
+                return False
+        return False
     
-    print(f"\nDone! Videos saved to: {output_dir}")
+    total_videos = len(motion_names) * len(modes_to_run)
+    print(f"Total videos to generate: {total_videos}")
+    
+    for motion_name in tqdm(motion_names, desc="Recording motions"):
+        motion_data = motion_dataset[motion_name]
+        captions = motion_data.get("captions", [])
+        caption = captions[0] if captions else ""
+        motion_base_name = motion_name.replace('.npz', '')
+        
+        for mode in modes_to_run:
+            # Create mode-specific subdirectory for "all" mode
+            if args.mode == "all":
+                mode_output_dir = os.path.join(base_output_dir, mode)
+                os.makedirs(mode_output_dir, exist_ok=True)
+                output_path = os.path.join(mode_output_dir, f"{motion_base_name}_{mode}.mp4")
+            else:
+                output_path = os.path.join(base_output_dir, f"{motion_base_name}_{mode}.mp4")
+            
+            success = record_single_mode(motion_data, output_path, mode, caption)
+            
+            if success:
+                tqdm.write(f"  Saved: {output_path}")
+            else:
+                tqdm.write(f"  Failed: {motion_name} ({mode})")
+    
+    print(f"\nDone! Videos saved to: {base_output_dir}")
+    if args.mode == "all":
+        print(f"Subdirectories: {', '.join(ALL_MODES)}")
 
