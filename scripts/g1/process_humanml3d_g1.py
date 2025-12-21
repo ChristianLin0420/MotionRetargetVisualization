@@ -528,6 +528,10 @@ def retarget_data(train_data, device, smpl_parser_n, optimized_shape_scale):
         caption_path = f"../../data/texts/{data_key.replace('.npz', '.txt')}"
         captions = read_captions_from_file(caption_path)
         
+        # Compute target keypoints (the 13 points used for IK matching)
+        target_keypoints = joints[:, smpl_link_pick_idx].clone()
+        target_keypoints[..., 2] -= height_correction
+        
         retarget_data_dict[data_key] = {
             "root_trans_offset": root_trans_offset_dump.squeeze().cpu().detach().numpy(),
             "dof": dof_pos.squeeze().cpu().detach().numpy(),
@@ -537,6 +541,10 @@ def retarget_data(train_data, device, smpl_parser_n, optimized_shape_scale):
             "captions": captions,
             "left_hand_rotmat": left_hand_rotmat.cpu().detach().numpy(),
             "right_hand_rotmat": right_hand_rotmat.cpu().detach().numpy(),
+            # New fields for multi-stage visualization
+            "smpl_pose_aa": pose_aa_walk.cpu().detach().numpy(),  # Original SMPL pose (axis-angle)
+            "smpl_betas": shape_new.cpu().detach().numpy(),       # SMPL body shape parameters
+            "target_keypoints": target_keypoints.cpu().detach().numpy(),  # 13 IK target keypoints
         }
         
         # Mirror the data
@@ -550,11 +558,14 @@ def retarget_data(train_data, device, smpl_parser_n, optimized_shape_scale):
         mirror_mocap_global_translation = mocap_global_translation.clone()
         mirror_left_hand_rotmat = left_hand_rotmat.clone()
         mirror_right_hand_rotmat = right_hand_rotmat.clone()
+        mirror_smpl_pose_aa = pose_aa_walk.clone()
+        mirror_target_keypoints = target_keypoints.clone()
         
         # Invert the Y-axis in translations
         mirror_root_trans[:, 1] = -mirror_root_trans[:, 1]
         mirror_global_translation[:, :, 1] = -mirror_global_translation[:, :, 1]
         mirror_mocap_global_translation[:, :, 1] = -mirror_mocap_global_translation[:, :, 1]
+        mirror_target_keypoints[:, :, 1] = -mirror_target_keypoints[:, :, 1]
 
         # Adjust root rotation
         mirror_gt_root_rot = sRot.from_rotvec(mirror_gt_root_rot.cpu().numpy()).as_matrix()
@@ -629,6 +640,18 @@ def retarget_data(train_data, device, smpl_parser_n, optimized_shape_scale):
 
         mirror_left_hand_rotmat, mirror_right_hand_rotmat = deepcopy(mirror_right_hand_rotmat), deepcopy(mirror_left_hand_rotmat)
         
+        # Mirror target keypoints - swap left/right pairs
+        # smpl_link_pick order: Pelvis, L_Hip, L_Knee, L_Ankle, R_Hip, R_Knee, R_Ankle, 
+        #                       L_Shoulder, L_Elbow, L_Wrist, R_Shoulder, R_Elbow, R_Wrist
+        target_kp_symmetric_pairs = [(1, 4), (2, 5), (3, 6), (7, 10), (8, 11), (9, 12)]
+        for left_idx, right_idx in target_kp_symmetric_pairs:
+            temp = mirror_target_keypoints[:, left_idx, :].clone()
+            mirror_target_keypoints[:, left_idx, :] = mirror_target_keypoints[:, right_idx, :]
+            mirror_target_keypoints[:, right_idx, :] = temp
+        
+        # Mirror SMPL pose - need to handle axis-angle mirroring
+        mirror_smpl_pose_aa_np = mirror_smpl_pose_aa.cpu().numpy()
+        
         retarget_data_dict['M' + data_key] = {
             "root_trans_offset": mirror_root_trans.squeeze().cpu().detach().numpy(),
             "dof": mirror_dof.squeeze().cpu().detach().numpy(),
@@ -638,6 +661,10 @@ def retarget_data(train_data, device, smpl_parser_n, optimized_shape_scale):
             "captions": mirror_caption,
             "left_hand_rotmat": mirror_left_hand_rotmat,
             "right_hand_rotmat": mirror_right_hand_rotmat,
+            # New fields for multi-stage visualization
+            "smpl_pose_aa": mirror_smpl_pose_aa_np,
+            "smpl_betas": shape_new.cpu().detach().numpy(),
+            "target_keypoints": mirror_target_keypoints.cpu().detach().numpy(),
         }
     
     # Configuration information
@@ -649,6 +676,14 @@ def retarget_data(train_data, device, smpl_parser_n, optimized_shape_scale):
         "list_selected_joints": list_selected_joints,
         "left_foot_name": "left_ankle_roll_link",
         "right_foot_name": "right_ankle_roll_link",
+        # Keypoint mapping for visualization
+        "smpl_joint_names": SMPL_BONE_ORDER_NAMES,
+        "smpl_link_pick": smpl_link_pick,
+        "robot_link_pick": robot_link_pick,
+        "robot_link_names": robot_link_names,
+        "robot_joint_names": robot_joint_names,
+        # Parent indices for skeleton drawing (SMPL skeleton)
+        "smpl_parent_indices": [-1, 0, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 9, 9, 12, 13, 14, 16, 17, 18, 19, 20, 21],
     }
     
     return retarget_data_dict
