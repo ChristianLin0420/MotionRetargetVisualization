@@ -247,7 +247,7 @@ This mode displays three synchronized panels showing the complete transformation
 python mujoco_comparison_recorder.py --mode sidebyside --max_motions 10
 ```
 
-<video src="media/sidebyside.mp4" controls width="100%"></video>
+![Side-by-Side Comparison](media/sidebyside.gif)
 
 | Panel | Content | Description |
 |-------|---------|-------------|
@@ -274,7 +274,7 @@ All three stages are rendered on top of each other in a single view, using diffe
 python mujoco_comparison_recorder.py --mode overlay --max_motions 10
 ```
 
-<video src="media/overlay.mp4" controls width="100%"></video>
+![Overlay View](media/overlay.gif)
 
 | Color | Element | Purpose |
 |-------|---------|---------|
@@ -302,7 +302,7 @@ A color-coded visualization where each of the 13 joint mappings has a unique col
 python mujoco_comparison_recorder.py --mode correspondence --max_motions 10
 ```
 
-<video src="media/correspondence.mp4" controls width="100%"></video>
+![Joint Correspondence](media/correspondence.gif)
 
 | Color | Joint Mapping |
 |-------|---------------|
@@ -332,7 +332,7 @@ Real-time error measurement with color gradient showing retargeting quality:
 python mujoco_comparison_recorder.py --mode error --max_motions 10
 ```
 
-<video src="media/error.mp4" controls width="100%"></video>
+![IK Error Visualization](media/error.gif)
 
 | Error Range | Color | Meaning |
 |-------------|-------|---------|
@@ -365,7 +365,7 @@ python mujoco_comparison_recorder.py --mode error --max_motions 10
 python mujoco_comparison_recorder.py --mode multiview --max_motions 10
 ```
 
-<video src="media/multiview.mp4" controls width="100%"></video>
+![Multi-View](media/multiview.gif)
 
 | View | Azimuth | Elevation | Best For |
 |------|---------|-----------|----------|
@@ -394,7 +394,7 @@ Motion paths showing the movement history of key joints with fading trails:
 python mujoco_comparison_recorder.py --mode trajectory --max_motions 10
 ```
 
-<video src="media/trajectory.mp4" controls width="100%"></video>
+![Trajectory Trails](media/trajectory.gif)
 
 | Joint | Color | Trail Meaning |
 |-------|-------|---------------|
@@ -431,7 +431,7 @@ python mujoco_comparison_recorder.py --mode angles --max_motions 10
 python joint_angle_plotter.py --max_motions 10
 ```
 
-<video src="media/angles.mp4" controls width="100%"></video>
+![Joint Angle Comparison](media/angles.gif)
 
 | Plot Line | Style | Source |
 |-----------|-------|--------|
